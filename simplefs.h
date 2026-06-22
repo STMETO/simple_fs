@@ -262,7 +262,7 @@ struct simplefs_sb_info {
 
     uint32_t nr_istore_blocks;/* Inode存储区占用多少个4KB块 */
     uint32_t nr_ifree_blocks; /* inode空闲位图占用的块数，位图用来标记哪些inode未被占用 */
-    uint32_t nr_bfree_blocks; /* 数据块空闲位图占用的块数，标记哪些4KB数据块空闲可用 */
+    uint32_t nr_bfree_blocks; /* 数据块空闲位图占用的块数，位图标记哪些4KB数据块空闲可用 */
 
     uint32_t nr_free_inodes;  /* 当前剩余空闲inode总数，创建文件时消耗，删除文件时回收 */
     uint32_t nr_free_blocks;  /* 当前剩余空闲数据块总数，写入文件分配块时消耗 */
