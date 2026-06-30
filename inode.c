@@ -1201,24 +1201,52 @@ release_new:
     return ret;
 }
 
+/**
+ * simplefs_mkdir - VFS inode_operations.mkdir 回调函数，实现 mkdir() 系统调用
+ * 功能：创建子目录，底层完全复用通用文件创建函数 simplefs_create
+ * 核心逻辑：给 mode 强制或上 S_IFDIR，标记文件类型为目录，其余创建逻辑全部复用 create
+ *
+ * 多内核版本兼容说明：
+ * Linux 不同版本内核对 mkdir 回调的第一个参数做了修改：
+ * 1. 6.15+：返回值是 struct dentry*，第一个参数 struct mnt_idmap *id
+ * 2. 6.3 ~ 6.14：返回值 int，第一个参数 struct mnt_idmap *id
+ * 3. 5.12 ~ 6.2：返回值 int，第一个参数 struct user_namespace *ns
+ * 4. 5.12 之前：返回值 int，无命名空间参数，直接传 dir 开头
+ *
+ * 入参统一含义（以新版为例）：
+ * @id: 挂载ID映射，用于权限判断（高版本内核）
+ * @dir: 父目录inode，新建目录存放于此
+ * @dentry: 待创建目录名对应的目录项
+ * @mode: 用户传入的权限位(0755/0777等)，函数内部强制追加目录类型标记 S_IFDIR
+ * 返回：
+ *  6.15+：成功返回NULL，失败返回 ERR_PTR(负数错误码)
+ *  旧版本：成功返回0，失败返回负错误码
+ */
 #if SIMPLEFS_AT_LEAST(6, 15, 0)
+// Linux 6.15 及更新内核：mkdir 接口变更，返回 dentry* 类型
 static struct dentry *simplefs_mkdir(struct mnt_idmap *id,
                                      struct inode *dir,
                                      struct dentry *dentry,
                                      umode_t mode)
 {
+    // mode | S_IFDIR：在用户权限基础上，强制标记该inode为目录类型
+    // 最后参数excl传0，代表不使用O_EXCL逻辑
     int ret = simplefs_create(id, dir, dentry, mode | S_IFDIR, 0);
+    // create返回0代表成功，返回NULL；否则包装错误码为指针返回
     return ret ? ERR_PTR(ret) : NULL;
 }
 #elif SIMPLEFS_AT_LEAST(6, 3, 0)
+// Linux 6.3 ~ 6.14：带 mnt_idmap，返回值int
 static int simplefs_mkdir(struct mnt_idmap *id,
                           struct inode *dir,
                           struct dentry *dentry,
                           umode_t mode)
 {
+    // 复用create，强制设置文件类型为目录 S_IFDIR
     return simplefs_create(id, dir, dentry, mode | S_IFDIR, 0);
 }
 #elif SIMPLEFS_AT_LEAST(5, 12, 0)
+// Linux 5.12 ~ 6.2：参数为 user_namespace，返回int
 static int simplefs_mkdir(struct user_namespace *ns,
                           struct inode *dir,
                           struct dentry *dentry,
@@ -1227,6 +1255,7 @@ static int simplefs_mkdir(struct user_namespace *ns,
     return simplefs_create(ns, dir, dentry, mode | S_IFDIR, 0);
 }
 #else
+// Linux 5.12 以前老旧内核：无命名空间参数，仅 dir/dentry/mode/excl
 static int simplefs_mkdir(struct inode *dir,
                           struct dentry *dentry,
                           umode_t mode)
@@ -1234,6 +1263,7 @@ static int simplefs_mkdir(struct inode *dir,
     return simplefs_create(dir, dentry, mode | S_IFDIR, 0);
 }
 #endif
+
 
 static int simplefs_rmdir(struct inode *dir, struct dentry *dentry)
 {
@@ -1261,56 +1291,88 @@ static int simplefs_rmdir(struct inode *dir, struct dentry *dentry)
     return simplefs_unlink(dir, dentry);
 }
 
+/**
+ * simplefs_link - VFS inode_operations.link 回调，实现 link() 系统调用（创建硬链接）
+ * @old_dentry：源文件对应的dentry，从中取出原有inode
+ * @dir：目标父目录inode，硬链接新名字创建在这个目录下
+ * @dentry：新硬链接的文件名dentry
+ * 返回：0 成功；负数错误码(-EIO / -EMLINK / -ENOSPC)
+ *
+ * 硬链接核心特性：
+ * 1. 不新建任何inode，多个文件名共享同一个inode；
+ * 2. 只在目标父目录新增一条目录项：【新文件名 + 原有文件ino】；
+ * 3. 对应inode的硬链接计数 nlink +1；
+ * 4. 删除任意一条硬链接只会nlink-1，计数归0才会真正释放文件磁盘资源。
+ *
+ * 整体流程：
+ * 1. 读取目标父目录的extent索引块，校验目录是否已满；
+ * 2. 调用simplefs_get_available_ext_idx查找可写入的extent空位；
+ * 3. 空白extent则调用simplefs_put_new_ext分配一整块目录存储区；
+ * 4. 在目录块写入新文件名 + 原文件ino；
+ * 5. 递增目录三层文件计数，标记缓冲区脏页；
+ * 6. 原inode链接数+1，增加inode引用计数；
+ * 7. d_instantiate绑定新dentry与原有inode，完成硬链接创建；
+ * 失败回滚：若中途分配了新目录extent则整块释放，避免磁盘泄漏。
+ */
 static int simplefs_link(struct dentry *old_dentry,
-                         struct inode *dir,
-                         struct dentry *dentry)
+                        struct inode *dir,
+                        struct dentry *dentry)
 {
+    // 源文件inode（多个硬链接共享这个inode，不会新建）
     struct inode *old_inode = d_inode(old_dentry);
     struct super_block *sb = old_inode->i_sb;
+    // 目标父目录inode私有扩展，存放父目录ei_block索引块号
     struct simplefs_inode_info *ci_dir = SIMPLEFS_INODE(dir);
+    // 父目录extent索引块内存结构体
     struct simplefs_file_ei_block *eblock = NULL;
+    // 待写入的单个目录数据块
     struct simplefs_dir_block *dblock;
+    // bh：父目录索引块缓冲区；bh2：临时目录数据块缓冲区
     struct buffer_head *bh = NULL, *bh2 = NULL;
-    int ret = 0, alloc = false;
+    int ret = 0, alloc = false; // alloc标记是否新分配目录extent，失败需要释放
     int ei = 0, bi = 0;
-    uint32_t avail;
+    uint32_t avail; // 可用extent数组下标
 
+    // 读取父目录专属extent索引块ei_block
     bh = sb_bread(sb, ci_dir->ei_block);
+    // 读盘IO失败直接释放缓冲区返回错误
     if (!bh)
         return -EIO;
 
     eblock = (struct simplefs_file_ei_block *) bh->b_data;
+    // 校验父目录子文件达到最大上限，无法新增硬链接
     if (eblock->nr_files == SIMPLEFS_MAX_SUBFILES) {
         ret = -EMLINK;
         printk(KERN_INFO "directory is full");
         goto end;
     }
 
+    // 查找父目录中可以存放新条目的extent下标
     int dir_nr_files = eblock->nr_files;
     avail = simplefs_get_available_ext_idx(&dir_nr_files, eblock);
 
-    /* Validate avail index is within bounds */
+    // 可用下标超出extent最大数量，目录无空位
     if (avail >= SIMPLEFS_MAX_EXTENTS) {
         ret = -EMLINK;
         goto end;
     }
 
-    /* if there is not any empty space, alloc new one */
+    // 当前extent完全空白，未分配磁盘，分配一整块连续目录存储区
     if (!dir_nr_files && !eblock->extents[avail].ee_start) {
-        ret = simplefs_put_new_ext(sb, avail, eblock);
+    ret = simplefs_put_new_ext(sb, avail, eblock);
         switch (ret) {
-        case -ENOSPC:
-            ret = -ENOSPC;
-            goto end;
-        case -EIO:
-            ret = -EIO;
+            case -ENOSPC: // 磁盘无空闲块，直接跳end释放bh
+                ret = -ENOSPC;
+                goto end;
+            case -EIO:    // 分配extent读盘失败，需要释放刚分配的extent
+                ret = -EIO;
             goto put_block;
         }
-        alloc = true;
+        alloc = true; // 标记已分配新extent，失败时走put_block释放
     }
 
-    /* TODO: fix from 8 to dynamic value */
-    /* Find which simplefs_dir_block has free space */
+    // 在目标extent内遍历，找到第一个未存满的目录数据块
+    /* TODO：硬编码ee_len，后续改为动态读取 */
     for (bi = 0; bi < eblock->extents[avail].ee_len; bi++) {
         bh2 = sb_bread(sb, eblock->extents[avail].ee_start + bi);
         if (!bh2) {
@@ -1318,38 +1380,70 @@ static int simplefs_link(struct dentry *old_dentry,
             goto put_block;
         }
         dblock = (struct simplefs_dir_block *) bh2->b_data;
+        // 当前目录块未满，跳出循环使用该块写入条目
         if (dblock->nr_files != SIMPLEFS_FILES_PER_BLOCK)
             break;
         else
-            brelse(bh2);
+            brelse(bh2); // 当前块已满，释放继续遍历下一块
     }
 
-    /* write the file info into simplefs_dir_block */
+    // 核心：写入硬链接目录条目：新文件名 + 原文件inode编号（不新建ino）
     simplefs_set_file_into_dir(dblock, old_inode->i_ino, dentry->d_name.name);
 
+    // 三层文件计数同步+1
     eblock->extents[avail].nr_files++;
     eblock->nr_files++;
+    // 目录数据块被修改，标记脏页
     mark_buffer_dirty(bh2);
+    // 父目录索引块计数变更，标记脏页
     mark_buffer_dirty(bh);
     brelse(bh2);
     brelse(bh);
 
+    // 1. 原inode硬链接计数nlink +1（硬链接核心操作）
     inode_inc_link_count(old_inode);
+    // 2. 增加inode引用计数，防止inode被提前回收释放
     ihold(old_inode);
+    // 绑定新dentry与原有inode，存入VFS dcache缓存
     d_instantiate(dentry, old_inode);
     return ret;
 
-put_block:
+    // 回滚分支：分配过新目录extent但中途出错，释放整块extent磁盘
+    put_block:
     if (alloc && eblock->extents[ei].ee_start) {
         put_blocks(SIMPLEFS_SB(sb), eblock->extents[ei].ee_start,
-                   eblock->extents[ei].ee_len);
+        eblock->extents[ei].ee_len);
         memset(&eblock->extents[ei], 0, sizeof(struct simplefs_extent));
     }
-end:
+    // 收尾分支：仅释放父目录索引块缓冲区
+    end:
     brelse(bh);
     return ret;
 }
 
+
+/**
+ * simplefs_symlink - VFS目录inode_ops.symlink 回调函数，实现系统调用 symlink(2)
+ * 功能：创建软链接文件（符号链接）
+ * 软链接本质：独立inode，自身不存文件数据，仅存储目标路径字符串；
+ * SimpleFS特殊设计：短路径直接存在inode私有内存ci->i_data，无需分配数据块
+ *
+ * 内核多版本兼容：不同内核symlink回调第一个参数命名空间接口不同，条件编译区分
+ * @dir: 父目录inode，软链接存放于此目录
+ * @dentry: 软链接自身文件名对应的目录项
+ * @symname: 软链接指向的目标路径字符串
+ * 返回值：0 创建成功；负数错误码(-ENAMETOOLONG/-EIO/-EMLINK/-ENOSPC)
+ *
+ * 整体流程：
+ * 1. 校验目标路径长度，不能超过ci->i_data数组容量
+ * 2. 调用simplefs_new_inode分配S_IFLNK类型独立inode（软链接专属inode）
+ * 3. 读取父目录extent索引块，查找可写入的extent空位
+ * 4. 空白extent则分配一整块目录存储extent
+ * 5. 在目录块写入「软链接文件名+自身ino」目录条目
+ * 6. 将目标路径symname拷贝到inode私有ci->i_data，设置i_size为路径长度
+ * 7. 标记inode脏页、绑定dentry与inode返回成功
+ * 资源回滚：中途失败逐层释放已分配extent、ei_block、inode编号，无磁盘泄漏
+ */
 #if SIMPLEFS_AT_LEAST(6, 3, 0)
 static int simplefs_symlink(struct mnt_idmap *id,
                             struct inode *dir,
@@ -1367,24 +1461,32 @@ static int simplefs_symlink(struct inode *dir,
 #endif
 {
     struct super_block *sb = dir->i_sb;
+    // 目标路径长度+结束符\0
     unsigned int l = strlen(symname) + 1;
+    // 新建软链接专属inode
     struct inode *inode = simplefs_new_inode(dir, S_IFLNK | S_IRWXUGO);
+    // 软链接inode私有扩展，i_data存放目标路径字符串
     struct simplefs_inode_info *ci = SIMPLEFS_INODE(inode);
+    // 父目录inode私有扩展，存放父目录ei索引块号
     struct simplefs_inode_info *ci_dir = SIMPLEFS_INODE(dir);
+    // 父目录extent索引块内存结构体
     struct simplefs_file_ei_block *eblock = NULL;
+    // 单个目录数据块，写入软链接目录条目
     struct simplefs_dir_block *dblock = NULL;
+    // bh：父目录索引块缓冲区；bh2：临时目录数据块缓冲区
     struct buffer_head *bh = NULL, *bh2 = NULL;
-    int ret = 0, alloc = false;
+    int ret = 0, alloc = false; // alloc标记是否新分配了目录extent，失败需要释放
     int ei = 0, bi = 0;
-    uint32_t avail;
+    uint32_t avail; // 父目录可用extent下标
 
-    /* Check if symlink content is not too long */
+    /* 1. 校验软链接目标路径长度，不能超过ci->i_data数组大小 */
+    // 软链接路径直接存在inode私有缓冲区，不分配额外数据块，长度受限
     if (l > sizeof(ci->i_data)) {
         ret = -ENAMETOOLONG;
-        goto iput;
+        goto iput; // 路径超长，直接释放新建的inode
     }
 
-    /* fill directory data block */
+    /* 2. 读取父目录专属extent索引块ei_block */
     bh = sb_bread(sb, ci_dir->ei_block);
     if (!bh) {
         ret = -EIO;
@@ -1392,37 +1494,39 @@ static int simplefs_symlink(struct inode *dir,
     }
     eblock = (struct simplefs_file_ei_block *) bh->b_data;
 
+    /* 校验父目录子文件是否达到上限，目录满无法新增 */
     if (eblock->nr_files == SIMPLEFS_MAX_SUBFILES) {
         ret = -EMLINK;
         printk(KERN_INFO "directory is full");
         goto iput;
     }
 
+    /* 3. 查找父目录可用extent下标，复用已有未满extent或空白extent */
     int dir_nr_files = eblock->nr_files;
     avail = simplefs_get_available_ext_idx(&dir_nr_files, eblock);
 
-    /* Validate avail index is within bounds */
+    /* 可用下标超出extent数组最大长度，无空位 */
     if (avail >= SIMPLEFS_MAX_EXTENTS) {
         ret = -EMLINK;
         goto iput;
     }
 
-    /* if there is not any empty space, alloc new one */
+    /* 4. 当前extent完全空白，未分配磁盘块，分配全新目录extent存储区 */
     if (!dir_nr_files && !eblock->extents[avail].ee_start) {
         ret = simplefs_put_new_ext(sb, avail, eblock);
         switch (ret) {
-        case -ENOSPC:
+        case -ENOSPC: // 无空闲磁盘块，仅释放inode资源
             ret = -ENOSPC;
             goto iput;
-        case -EIO:
+        case -EIO:    // 分配extent读盘失败，需要释放刚分配的整块extent
             ret = -EIO;
             goto put_block;
         }
-        alloc = true;
+        alloc = true; // 标记已分配新extent，失败时进入put_block释放
     }
 
-    /* TODO: fix from 8 to dynamic value */
-    /* Find which simplefs_dir_block has free space */
+    /* 5. 在目标extent内遍历，找到第一个未存满的目录数据块 */
+    /* TODO：硬编码ee_len，后续优化动态读取 */
     for (bi = 0; bi < eblock->extents[avail].ee_len; bi++) {
         bh2 = sb_bread(sb, eblock->extents[avail].ee_start + bi);
         if (!bh2) {
@@ -1430,42 +1534,61 @@ static int simplefs_symlink(struct inode *dir,
             goto put_block;
         }
         dblock = (struct simplefs_dir_block *) bh2->b_data;
+        // 当前目录块未满，跳出循环使用该块写入条目
         if (dblock->nr_files != SIMPLEFS_FILES_PER_BLOCK)
             break;
         else
-            brelse(bh2);
+            brelse(bh2); // 当前块已满，释放继续遍历下一块
     }
 
-    /* write the file info into simplefs_dir_block */
+    /* 6. 将软链接条目（文件名+自身ino）写入父目录磁盘块 */
     simplefs_set_file_into_dir(dblock, inode->i_ino, dentry->d_name.name);
 
+    /* 同步三层文件计数自增 */
     eblock->extents[avail].nr_files++;
     eblock->nr_files++;
+    // 修改目录数据块，标记脏页等待刷盘
     mark_buffer_dirty(bh2);
+    // 父目录索引块计数变更，标记脏页
     mark_buffer_dirty(bh);
     brelse(bh2);
     brelse(bh);
 
+    /* 7. 核心：把软链接目标路径存入inode私有缓冲区ci->i_data */
+    // VFS软链接读取接口readlink会读取inode->i_link
     inode->i_link = (char *) ci->i_data;
+    // 拷贝目标路径字符串到私有缓冲区
     memcpy(inode->i_link, symname, l);
+    // 软链接文件大小 = 目标路径字符串长度（不含末尾\0）
     inode->i_size = l - 1;
+    // inode元数据变更，标记脏页持久化
     mark_inode_dirty(inode);
+
+    /* 8. 绑定dentry与新建软链接inode，存入VFS缓存 */
     d_instantiate(dentry, inode);
     return 0;
 
+/* ========== 三层失败资源回滚分支，由深到浅释放磁盘资源 ========== */
+// 分支1：分配了新目录extent后失败，先释放整块extent磁盘
 put_block:
     if (alloc && eblock->extents[ei].ee_start) {
         put_blocks(SIMPLEFS_SB(sb), eblock->extents[ei].ee_start,
                    eblock->extents[ei].ee_len);
         memset(&eblock->extents[ei], 0, sizeof(struct simplefs_extent));
     }
+// 分支2：inode已分配成功，写入目录条目前失败，释放inode全部磁盘资源
 iput:
+    // 释放软链接自身ei_block索引块
     put_blocks(SIMPLEFS_SB(sb), ci->ei_block, 1);
+    // 归还ino到位图，取消inode占用
     put_inode(SIMPLEFS_SB(sb), inode->i_ino);
+    // 释放内核inode内存缓存
     iput(inode);
+    // 释放父目录索引块缓冲区
     brelse(bh);
     return ret;
 }
+
 
 static const char *simplefs_get_link(struct dentry *dentry,
                                      struct inode *inode,
