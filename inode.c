@@ -897,38 +897,62 @@ release_bh:
 }
 
 
-/* Remove a link for a file including the reference in the parent directory.
- * If link count is 0, destroy file in this way:
- *   - remove the file from its parent directory.
- *   - cleanup blocks containing data
- *   - cleanup file index block
- *   - cleanup inode
+/**
+ * simplefs_unlink - VFS inode_operations.unlink 回调，实现 unlink() 系统调用
+ * @dir：待删除文件所在父目录inode
+ * @dentry：待删除文件名对应的目录项
+ * 返回：0 删除链接成功；负数IO错误码
+ *
+ * 整体核心逻辑分两大阶段：
+ * 阶段1：仅删除父目录里这条文件名记录（只删目录项，不删文件本体）
+ *    1. simplefs_remove_from_dir：遍历父目录，清除该文件名条目、合并空闲槽、递减目录文件计数
+ *    2. 更新父目录atime/mtime/ctime；如果删除的是目录，同步递减父目录链接数
+ *    3. 原文件inode硬链接计数nlink -1；若nlink>1，说明还有其他硬链接，直接返回，不回收磁盘资源
+ * 阶段2：当硬链接计数减到0，彻底销毁文件/目录/软链接，释放全部磁盘资源
+ *    1. 读取文件自身ei_block索引块，遍历所有extent：释放全部数据块、并清零数据块内容（擦除数据）
+ *    2. 清空ei_block索引块内存并落盘
+ *    3. 重置inode所有元数据（大小、块数、属主、时间、索引块号全部置0）
+ *    4. 普通文件/目录释放自身ei_block磁盘块；软链接不释放ei_block
+ *    5. 归还ino到位图，永久回收inode编号
+ *
+ * 特殊区分：
+ * 1. 软链接：无数据extent，跳过释放数据块逻辑，直接清空inode回收ino
+ * 2. 目录：删除目录项时父目录nlink-1，自身nlink-1；必须为空目录才能unlink(rmdir前置校验)
+ * 3. 硬链接多份：只删目录项、nlink-1，计数不为0则保留全部磁盘数据
  */
 static int simplefs_unlink(struct inode *dir, struct dentry *dentry)
 {
     struct super_block *sb = dir->i_sb;
     struct simplefs_sb_info *sbi = SIMPLEFS_SB(sb);
+    // 待删除文件对应的inode本体
     struct inode *inode = d_inode(dentry);
+    // bh：文件自身ei索引块缓冲区；bh2：遍历extent时单个数据块缓冲区
     struct buffer_head *bh = NULL, *bh2 = NULL;
+    // 文件专属extent索引块内存结构体
     struct simplefs_file_ei_block *file_block = NULL;
+    // 用于清零磁盘块的临时指针
     char *block;
 #if SIMPLEFS_AT_LEAST(6, 6, 0) && SIMPLEFS_LESS_EQUAL(6, 7, 0)
     struct timespec64 cur_time;
 #endif
+    // 循环下标：ei遍历extent，bi遍历extent内数据块
     int ei = 0, bi = 0;
     int ret = 0;
 
-    uint32_t ino = inode->i_ino;
-    uint32_t bno = 0;
+    uint32_t ino = inode->i_ino;    // 缓存待删除inode编号
+    uint32_t bno = 0;               // 缓存文件自身ei_block磁盘块号
 
+    // 1. 第一步：从父目录中删除该文件的目录条目（核心前置操作）
+    // 内部完成：遍历extent找到条目、清零inode标记、合并空闲槽、三层目录计数-1、标记目录脏页
     ret = simplefs_remove_from_dir(dir, dentry);
     if (ret != 0)
-        return ret;
+        return ret; // 目录删除失败，直接返回错误，不修改inode
 
+    // 软链接特殊分支：无数据块，直接跳转到清空inode回收逻辑
     if (S_ISLNK(inode->i_mode))
         goto clean_inode;
 
-        /* Update inode stats */
+    // 更新父目录时间戳：删除子项修改目录内容，刷新atime/mtime/ctime
 #if SIMPLEFS_AT_LEAST(6, 7, 0)
     simple_inode_init_ts(dir);
 #elif SIMPLEFS_AT_LEAST(6, 6, 0)
@@ -939,61 +963,68 @@ static int simplefs_unlink(struct inode *dir, struct dentry *dentry)
     dir->i_mtime = dir->i_atime = dir->i_ctime = current_time(dir);
 #endif
 
+    // 如果删除的是目录：
+    // 父目录链接数-1（子目录的..指向父目录，移除后少一条反向链接）
+    // 当前目录自身链接数-1（目录默认nlink=2，.和..）
     if (S_ISDIR(inode->i_mode)) {
         drop_nlink(dir);
         drop_nlink(inode);
     }
+    // 父目录元数据变更，标记脏页等待刷盘
     mark_inode_dirty(dir);
 
+    // 2. 判断：还有其他硬链接存在，仅nlink-1后直接返回，不销毁文件本体
     if (inode->i_nlink > 1) {
         inode_dec_link_count(inode);
         return ret;
     }
 
-    /* Cleans up pointed blocks when unlinking a file. If reading the index
-     * block fails, the inode is cleaned up regardless, resulting in the
-     * permanent loss of this file's blocks. If scrubbing a data block fails,
-     * do not terminate the operation (as it is already too late); instead,
-     * release the block and proceed.
-     */
+    // ========== 进入彻底销毁流程：nlink == 1，删完这条链接后无任何引用 ==========
+    // 获取文件专属extent索引块磁盘号（普通文件/目录才有ei_block，存数据extent）
     bno = SIMPLEFS_INODE(inode)->ei_block;
     bh = sb_bread(sb, bno);
+    // 读取索引块失败：依然要清空inode回收ino，跳过数据块释放
     if (!bh)
         goto clean_inode;
     file_block = (struct simplefs_file_ei_block *) bh->b_data;
 
+    // 遍历文件所有extent，释放每一段连续数据块
     for (ei = 0; ei < SIMPLEFS_MAX_EXTENTS; ei++) {
+        // ee_start=0代表后续无有效extent，直接跳出循环
         if (!file_block->extents[ei].ee_start)
             break;
 
+        // 1. 释放本段extent所有连续磁盘块（修改块位图，标记空闲）
         put_blocks(sbi, file_block->extents[ei].ee_start,
                    file_block->extents[ei].ee_len);
 
-        /* Scrub the extent */
+        // 2. 擦除数据：逐块清零磁盘内容，防止残留用户数据
         for (bi = 0; bi < file_block->extents[ei].ee_len; bi++) {
             bh2 = sb_bread(sb, file_block->extents[ei].ee_start + bi);
+            // 单块读盘失败不阻断整体删除，直接跳过该块
             if (!bh2)
                 continue;
             block = (char *) bh2->b_data;
-            memset(block, 0, SIMPLEFS_BLOCK_SIZE);
-            mark_buffer_dirty(bh2);
+            memset(block, 0, SIMPLEFS_BLOCK_SIZE); // 整块清零
+            mark_buffer_dirty(bh2);                // 脏页标记，持久化清零
             brelse(bh2);
         }
     }
 
-    /* Scrub index block */
+    // 清空文件自身的extent索引块，擦除所有extent记录
     memset(file_block, 0, SIMPLEFS_BLOCK_SIZE);
     mark_buffer_dirty(bh);
     brelse(bh);
 
 clean_inode:
-    /* Cleanup inode and mark dirty */
-    inode->i_blocks = 0;
-    SIMPLEFS_INODE(inode)->ei_block = 0;
-    inode->i_size = 0;
-    i_uid_write(inode, 0);
-    i_gid_write(inode, 0);
+    // ========== 统一清理inode元数据，重置所有字段 ==========
+    inode->i_blocks = 0;                  // 文件占用块数清零
+    SIMPLEFS_INODE(inode)->ei_block = 0;  // 清空私有索引块号
+    inode->i_size = 0;                    // 文件大小置0
+    i_uid_write(inode, 0);                // 属主清零
+    i_gid_write(inode, 0);               // 属组清零
 
+    // 全部时间戳清零
 #if SIMPLEFS_AT_LEAST(6, 7, 0)
     inode_set_mtime(inode, 0, 0);
     inode_set_atime(inode, 0, 0);
@@ -1005,17 +1036,46 @@ clean_inode:
     inode->i_ctime.tv_sec = inode->i_mtime.tv_sec = inode->i_atime.tv_sec = 0;
 #endif
 
+    // 硬链接计数最终减1，此时nlink变为0
     inode_dec_link_count(inode);
 
-    /* Free inode and index block from bitmap */
+    // 软链接不分配数据extent，不需要释放ei_block；普通文件/目录释放自身索引块
     if (!S_ISLNK(inode->i_mode))
         put_blocks(sbi, bno, 1);
-    inode->i_mode = 0;
-    put_inode(sbi, ino);
+    inode->i_mode = 0; // 文件类型/权限全部清空
+    put_inode(sbi, ino); // 归还inode编号到位图，标记ino空闲，彻底回收inode
 
     return ret;
 }
 
+
+/**
+ * simplefs_rename - VFS inode_operations.rename 回调，实现 rename() / mv 系统调用
+ * 支持两种场景：
+ *  1. 同目录改名：old_dir == new_dir，仅修改目录条目内文件名字符串
+ *  2. 跨目录移动：old_dir != new_dir，在新目录新建条目、旧目录删除原条目
+ * 不支持交换文件(RENAME_EXCHANGE)、白洞(RENAME_WHITEOUT) flags，遇到直接返回-EINVAL
+ *
+ * 多内核版本兼容：不同内核rename第一个参数为命名空间，条件编译区分接口原型
+ * @old_dir: 原父目录inode（文件当前所在目录）
+ * @old_dentry: 原文件名dentry
+ * @new_dir: 目标新父目录inode
+ * @new_dentry: 新文件名dentry
+ * @flags: rename操作标志位
+ * 返回：0 成功；负数错误码(-EINVAL/-ENAMETOOLONG/-EIO/-EEXIST/-EMLINK/-ENOSPC)
+ *
+ * 完整执行流程：
+ * 1. 非法flag、新文件名长度前置校验，快速失败
+ * 2. 读取目标新目录的extent索引块eblock_new，三层循环遍历新目录所有条目：
+ *    a) 同目录：匹配到原文件条目，直接原地修改文件名字符串，标记脏后直接返回
+ *    b) 跨目录：遍历过程中若发现新目录已存在同名文件，返回-EEXIST；同时记录第一个可用空闲槽new_pos
+ * 3. 若无空闲槽位，分配一整块新extent目录存储区
+ * 4. 在新目录空闲槽写入新文件名 + 源文件ino，递增新目录文件计数、更新新目录时间戳
+ * 5. 若移动对象是目录，新父目录链接数+1
+ * 6. 调用simplefs_remove_from_dir删除旧目录中原文件名条目
+ * 7. 若移动对象是目录，原父目录链接数-1，更新旧目录时间戳并标记脏
+ * 资源回滚：分配新extent失败时释放整块磁盘块，防止泄漏
+ */
 #if SIMPLEFS_AT_LEAST(6, 3, 0)
 static int simplefs_rename(struct mnt_idmap *id,
                            struct inode *old_dir,
@@ -1039,34 +1099,42 @@ static int simplefs_rename(struct inode *old_dir,
 #endif
 {
     struct super_block *sb = old_dir->i_sb;
+    // 新目录inode私有扩展，存放新目录ei_block索引块号
     struct simplefs_inode_info *ci_new = SIMPLEFS_INODE(new_dir);
+    // 待移动/改名的源文件inode本体
     struct inode *src = d_inode(old_dentry);
+    // bh_new：新目录顶层extent索引块缓冲区；bh2：遍历单块目录数据块临时缓冲区
     struct buffer_head *bh_new = NULL, *bh2 = NULL;
+    // 新目录extent索引块结构体
     struct simplefs_file_ei_block *eblock_new = NULL;
+    // 单块目录数据块，存放文件条目files[]
     struct simplefs_dir_block *dblock = NULL;
 
 #if SIMPLEFS_AT_LEAST(6, 6, 0) && SIMPLEFS_LESS_EQUAL(6, 7, 0)
     struct timespec64 cur_time;
 #endif
 
-    int new_pos = -1, ret = 0;
+    int new_pos = -1, ret = 0; // new_pos：新目录可写入条目的空闲下标，-1代表未找到
+    // 循环下标：ei-extent下标 bi-目录块下标 fi-条目下标
     int ei = 0, bi = 0, fi = 0, bno = 0;
 
-    /* fail with these unsupported flags */
+    /* 校验1：不支持交换、白洞两种高级rename标记，直接非法参数 */
     if (flags & (RENAME_EXCHANGE | RENAME_WHITEOUT))
         return -EINVAL;
 
-    /* Check if filename is not too long */
+    /* 校验2：新文件名长度超出上限 */
     if (strlen(new_dentry->d_name.name) > SIMPLEFS_FILENAME_LEN)
         return -ENAMETOOLONG;
 
-    /* Fail if new_dentry exists or if new_dir is full */
+    /* 读取目标新目录的顶层extent索引块 */
     bh_new = sb_bread(sb, ci_new->ei_block);
     if (!bh_new)
         return -EIO;
-
     eblock_new = (struct simplefs_file_ei_block *) bh_new->b_data;
+
+    /* 三层循环遍历新目录所有extent、目录块、文件条目 */
     for (ei = 0; new_pos < 0 && ei < SIMPLEFS_MAX_EXTENTS; ei++) {
+        // ee_start=0 后续无有效extent，终止循环
         if (!eblock_new->extents[ei].ee_start)
             break;
 
@@ -1076,25 +1144,26 @@ static int simplefs_rename(struct inode *old_dir,
                 ret = -EIO;
                 goto release_new;
             }
-
             dblock = (struct simplefs_dir_block *) bh2->b_data;
             int blk_nr_files = dblock->nr_files;
+
             for (fi = 0; blk_nr_files;) {
-                /* src and target are the same dir (inode is same) */
+                // 分支A：原目录 == 目标目录，同目录改名逻辑
                 if (new_dir == old_dir) {
+                    // 匹配到原文件条目，直接原地修改文件名
                     if (dblock->files[fi].inode &&
                         !strncmp(dblock->files[fi].filename,
                                  old_dentry->d_name.name,
                                  SIMPLEFS_FILENAME_LEN)) {
                         strncpy(dblock->files[fi].filename,
                                 new_dentry->d_name.name, SIMPLEFS_FILENAME_LEN);
-                        mark_buffer_dirty(bh2);
+                        mark_buffer_dirty(bh2); // 目录块修改，标记脏页
                         brelse(bh2);
-                        goto release_new;
+                        goto release_new; // 改名完成，直接释放缓冲区返回
                     }
                 } else {
-                    /* src and target are different, then check if the
-                    same name in the target directory */
+                    // 分支B：跨目录移动逻辑
+                    // 1. 检测新目录已存在同名文件，返回文件已存在错误
                     if (dblock->files[fi].inode &&
                         !strncmp(dblock->files[fi].filename,
                                  new_dentry->d_name.name,
@@ -1103,55 +1172,59 @@ static int simplefs_rename(struct inode *old_dir,
                         ret = -EEXIST;
                         goto release_new;
                     }
-                    /* find the empty index in target directory */
+                    // 2. 记录第一个可拆分的空闲槽位，用于写入新条目
                     if (new_pos < 0 && dblock->files[fi].nr_blk != 1) {
                         new_pos = fi + 1;
                         break;
                     }
                 }
                 blk_nr_files--;
-                fi += dblock->files[fi].nr_blk;
+                fi += dblock->files[fi].nr_blk; // 按nr_blk跳跃遍历条目，跳过碎片
             }
             brelse(bh2);
         }
     }
 
-    /* If new directory is full, fail */
+    /* 遍历完所有extent仍无空闲槽，目录存满 */
     if (new_pos < 0 && eblock_new->nr_files == SIMPLEFS_FILES_PER_EXT) {
         ret = -EMLINK;
         goto release_new;
     }
 
-    /* insert in new parent directory */
-    /* Get new freeblocks for extent if needed*/
+    /* 没有找到可用空闲extent，分配一整块全新目录extent存储区 */
     if (new_pos < 0) {
+        // 分配连续多块磁盘作为新extent
         bno = get_free_blocks(sb, SIMPLEFS_MAX_BLOCKS_PER_EXTENT);
         if (!bno) {
             ret = -ENOSPC;
             goto release_new;
         }
+        // 填充新extent元数据：起始块、长度、逻辑起始块号
         eblock_new->extents[ei].ee_start = bno;
         eblock_new->extents[ei].ee_len = SIMPLEFS_MAX_BLOCKS_PER_EXTENT;
         eblock_new->extents[ei].ee_block =
             ei ? eblock_new->extents[ei - 1].ee_block +
                      eblock_new->extents[ei - 1].ee_len
                : 0;
+        // 读取新extent第一块目录块
         bh2 = sb_bread(sb, eblock_new->extents[ei].ee_start + 0);
         if (!bh2) {
             ret = -EIO;
-            goto put_block;
+            goto put_block; // 分配extent成功但读块失败，需要释放整块extent
         }
         dblock = (struct simplefs_dir_block *) bh2->b_data;
-        mark_buffer_dirty(bh_new);
-        new_pos = 0;
+        mark_buffer_dirty(bh_new); // 顶层索引块extent信息变更，标记脏
+        new_pos = 0; // 新extent从0号槽写入
     }
+
+    /* 在新目录空闲槽写入条目：新文件名 + 源文件inode编号 */
     dblock->files[new_pos].inode = src->i_ino;
     strncpy(dblock->files[new_pos].filename, new_dentry->d_name.name,
             SIMPLEFS_FILENAME_LEN);
     mark_buffer_dirty(bh2);
     brelse(bh2);
 
-    /* Update new parent inode metadata */
+    /* 更新新父目录时间戳：新增子项，刷新atime/mtime/ctime */
 #if SIMPLEFS_AT_LEAST(6, 7, 0)
     simple_inode_init_ts(new_dir);
 #elif SIMPLEFS_AT_LEAST(6, 6, 0)
@@ -1163,16 +1236,17 @@ static int simplefs_rename(struct inode *old_dir,
         current_time(new_dir);
 #endif
 
+    // 移动的是目录：新目录增加一条..反向链接，链接数+1
     if (S_ISDIR(src->i_mode))
         inc_nlink(new_dir);
     mark_inode_dirty(new_dir);
 
-    /* remove target from old parent directory */
+    /* 删除旧父目录里原文件名的目录条目 */
     ret = simplefs_remove_from_dir(old_dir, old_dentry);
     if (ret != 0)
         goto release_new;
 
-        /* Update old parent inode metadata */
+    /* 更新旧父目录时间戳：移除子项，修改目录内容 */
 #if SIMPLEFS_AT_LEAST(6, 7, 0)
     simple_inode_init_ts(old_dir);
 #elif SIMPLEFS_AT_LEAST(6, 6, 0)
@@ -1184,22 +1258,26 @@ static int simplefs_rename(struct inode *old_dir,
         current_time(old_dir);
 #endif
 
+    // 移动的是目录：旧目录失去一条..反向链接，链接数-1
     if (S_ISDIR(src->i_mode))
         drop_nlink(old_dir);
     mark_inode_dirty(old_dir);
 
     return ret;
 
+/* 回滚分支：分配了新extent但中途出错，释放整块extent磁盘并清空extent元数据 */
 put_block:
     if (eblock_new->extents[ei].ee_start) {
         put_blocks(SIMPLEFS_SB(sb), eblock_new->extents[ei].ee_start,
                    eblock_new->extents[ei].ee_len);
         memset(&eblock_new->extents[ei], 0, sizeof(struct simplefs_extent));
     }
+/* 统一释放新目录顶层索引块缓冲区，函数收尾 */
 release_new:
     brelse(bh_new);
     return ret;
 }
+
 
 /**
  * simplefs_mkdir - VFS inode_operations.mkdir 回调函数，实现 mkdir() 系统调用
@@ -1265,31 +1343,54 @@ static int simplefs_mkdir(struct inode *dir,
 #endif
 
 
+/**
+ * simplefs_rmdir - VFS inode_operations.rmdir 回调，实现 rmdir() 删除空目录系统调用
+ * @dir: 待删除目录的父目录inode
+ * @dentry: 要删除的目录对应的目录项（目录名）
+ * 返回值：0 删除成功；负数错误码(-ENOTEMPTY 目录非空 / -EIO 读盘失败)
+ *
+ * 功能逻辑：
+ * rmdir 不实现完整删除逻辑，仅做**前置空目录校验**，校验通过后直接复用 simplefs_unlink 完成删除；
+ * 两条判空规则，双重保障防止删除非空目录：
+ * 1. 目录inode硬链接数不能大于2；
+ * 2. 读取目录自身ei_block索引块，判断目录内子文件总数 eblock->nr_files == 0；
+ * 校验全部通过后调用 unlink，执行移除父目录条目、释放目录所有磁盘资源、回收inode。
+ */
 static int simplefs_rmdir(struct inode *dir, struct dentry *dentry)
 {
     struct super_block *sb = dir->i_sb;
+    // 待删除的子目录inode
     struct inode *inode = d_inode(dentry);
+    // 缓冲区：存放待删目录自身的extent索引块ei_block
     struct buffer_head *bh;
+    // 目录专属extent索引块结构体，记录目录所有子文件统计
     struct simplefs_file_ei_block *eblock;
 
-    /* If the directory is not empty, fail */
+    /* 第一层校验：目录inode硬链接数 nlink > 2 代表目录内存在子目录 */
+    // 空目录默认nlink=2：自身 . 、父目录 ..
+    // 只要新建过任意子目录，子目录里的 .. 会让本目录nlink+1，nlink>2
     if (inode->i_nlink > 2)
         return -ENOTEMPTY;
 
+    /* 读取待删除目录自己的ei_block索引块 */
     bh = sb_bread(sb, SIMPLEFS_INODE(inode)->ei_block);
     if (!bh)
         return -EIO;
-
     eblock = (struct simplefs_file_ei_block *) bh->b_data;
+
+    /* 第二层校验：目录内部存在普通文件/软链接，子文件总数不为0 */
     if (eblock->nr_files != 0) {
-        brelse(bh);
+        brelse(bh); // 先释放缓冲区再返回
         return -ENOTEMPTY;
     }
+    // 校验通过，释放目录索引块缓冲区
     brelse(bh);
 
-    /* Remove directory with unlink */
+    /* 空目录校验全部通过，复用unlink统一销毁目录资源 */
+    // unlink会完成：父目录移除目录条目、释放目录所有extent磁盘块、回收inode
     return simplefs_unlink(dir, dentry);
 }
+
 
 /**
  * simplefs_link - VFS inode_operations.link 回调，实现 link() 系统调用（创建硬链接）
